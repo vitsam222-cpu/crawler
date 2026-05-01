@@ -17,9 +17,18 @@ from bs4 import BeautifulSoup
 APP_TITLE = "SEO Sitemap Crawler"
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/2.0; "
+    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/2.1; "
     "+https://example.com/seo-crawler)"
 )
+
+ASSET_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".avif", ".ico",
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".css", ".js", ".json", ".xml", ".txt",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".mp4", ".webm", ".mov", ".avi", ".mp3", ".wav", ".ogg",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+}
 
 RESULT_COLUMNS = [
     "URL",
@@ -47,6 +56,7 @@ class CrawlSettings:
     max_pages: int
     user_agent: str
     delay_between_requests: float
+    keep_assets: bool
 
 
 def normalize_text(value: str | None) -> str:
@@ -85,37 +95,77 @@ def strip_namespace(tag: str) -> str:
     return tag.split("}", 1)[-1] if "}" in tag else tag
 
 
+def is_asset_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in ASSET_EXTENSIONS)
+
+
+def get_direct_child_text_by_localname(parent, child_localname: str) -> str:
+    for child in list(parent):
+        if strip_namespace(child.tag).lower() == child_localname.lower():
+            return normalize_text(child.text or "")
+    return ""
+
+
 def parse_sitemap_xml(xml_bytes: bytes) -> tuple[str, list[str]]:
+    """
+    Correct sitemap parser:
+    - urlset: only direct /urlset/url/loc
+    - sitemapindex: only direct /sitemapindex/sitemap/loc
+    This intentionally ignores image:loc, video:loc, news:loc etc.
+    """
     xml_bytes = decompress_if_needed(xml_bytes)
 
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
         soup = BeautifulSoup(xml_bytes, "html.parser")
-        locs = [normalize_text(loc.get_text()) for loc in soup.find_all("loc")]
-        return "unknown", [loc for loc in locs if loc]
+        # Fallback, but still try to take loc directly inside url/sitemap.
+        urls = []
+        for url_tag in soup.find_all("url"):
+            loc = url_tag.find("loc", recursive=False)
+            if loc:
+                text = normalize_text(loc.get_text())
+                if text:
+                    urls.append(text)
+        if urls:
+            return "urlset", urls
+
+        sitemaps = []
+        for sm_tag in soup.find_all("sitemap"):
+            loc = sm_tag.find("loc", recursive=False)
+            if loc:
+                text = normalize_text(loc.get_text())
+                if text:
+                    sitemaps.append(text)
+        if sitemaps:
+            return "sitemapindex", sitemaps
+
+        return "unknown", []
 
     root_name = strip_namespace(root.tag).lower()
-    locs = []
-
-    for elem in root.iter():
-        if strip_namespace(elem.tag).lower() == "loc" and elem.text:
-            loc = normalize_text(elem.text)
-            if loc:
-                locs.append(loc)
-
-    if root_name == "sitemapindex":
-        return "sitemapindex", locs
 
     if root_name == "urlset":
+        locs = []
+        for url_node in list(root):
+            if strip_namespace(url_node.tag).lower() != "url":
+                continue
+            loc = get_direct_child_text_by_localname(url_node, "loc")
+            if loc:
+                locs.append(loc)
         return "urlset", locs
 
-    return "unknown", locs
+    if root_name == "sitemapindex":
+        locs = []
+        for sitemap_node in list(root):
+            if strip_namespace(sitemap_node.tag).lower() != "sitemap":
+                continue
+            loc = get_direct_child_text_by_localname(sitemap_node, "loc")
+            if loc:
+                locs.append(loc)
+        return "sitemapindex", locs
 
-
-def is_probably_sitemap_url(url: str) -> bool:
-    path = urlparse(url).path.lower()
-    return path.endswith(".xml") or "sitemap" in path
+    return "unknown", []
 
 
 async def fetch_bytes(client: httpx.AsyncClient, url: str) -> bytes:
@@ -128,23 +178,29 @@ async def extract_urls_from_one_sitemap(
     client: httpx.AsyncClient,
     sitemap_url: str,
     expand_sitemap_index: bool,
+    keep_assets: bool,
     log_box=None,
 ) -> list[dict]:
-    """
-    Strict logic:
-    - urlset: return locs as page URLs.
-    - sitemapindex + expand OFF: return empty and warning.
-    - sitemapindex + expand ON: fetch child sitemaps, return their urlset locs.
-    - never crawl page links.
-    """
     if log_box:
         log_box.info(f"Читаю sitemap: {sitemap_url}")
 
     content = await fetch_bytes(client, sitemap_url)
     sitemap_type, locs = parse_sitemap_xml(content)
 
+    def make_pages(source_sitemap: str, loc_list: list[str]) -> list[dict]:
+        pages = []
+        skipped_assets = 0
+        for loc in loc_list:
+            if not keep_assets and is_asset_url(loc):
+                skipped_assets += 1
+                continue
+            pages.append({"URL": loc, "Source sitemap": source_sitemap})
+        if log_box and skipped_assets:
+            log_box.info(f"Пропущено ассетов из {source_sitemap}: {skipped_assets}")
+        return pages
+
     if sitemap_type == "urlset":
-        return [{"URL": loc, "Source sitemap": sitemap_url} for loc in locs if loc and not is_probably_sitemap_url(loc)]
+        return make_pages(sitemap_url, locs)
 
     if sitemap_type == "sitemapindex":
         if not expand_sitemap_index:
@@ -157,19 +213,15 @@ async def extract_urls_from_one_sitemap(
 
         out = []
         for child_sitemap in locs:
-            if log_box:
-                log_box.info(f"Читаю вложенный sitemap: {child_sitemap}")
-
             try:
+                if log_box:
+                    log_box.info(f"Читаю вложенный sitemap: {child_sitemap}")
+
                 child_content = await fetch_bytes(client, child_sitemap)
                 child_type, child_locs = parse_sitemap_xml(child_content)
 
                 if child_type == "urlset":
-                    out.extend(
-                        {"URL": loc, "Source sitemap": child_sitemap}
-                        for loc in child_locs
-                        if loc and not is_probably_sitemap_url(loc)
-                    )
+                    out.extend(make_pages(child_sitemap, child_locs))
                 else:
                     if log_box:
                         log_box.warning(f"Пропущен вложенный sitemap не типа urlset: {child_sitemap}")
@@ -179,12 +231,9 @@ async def extract_urls_from_one_sitemap(
 
         return out
 
-    # Unknown XML: treat locs as URLs, but filter XML sitemap links unless expand is requested.
-    return [
-        {"URL": loc, "Source sitemap": sitemap_url}
-        for loc in locs
-        if loc and (expand_sitemap_index or not is_probably_sitemap_url(loc))
-    ]
+    if log_box:
+        log_box.error(f"Неизвестный формат sitemap: {sitemap_url}")
+    return []
 
 
 async def collect_urls(
@@ -208,6 +257,7 @@ async def collect_urls(
                     client=client,
                     sitemap_url=sitemap_url,
                     expand_sitemap_index=expand_sitemap_index,
+                    keep_assets=settings.keep_assets,
                     log_box=log_box,
                 )
                 all_pages.extend(pages)
@@ -495,7 +545,7 @@ def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🕷️", layout="wide")
 
     st.title("🕷️ SEO Sitemap Crawler")
-    st.caption("Жесткий режим: краулер обходит только URL, найденные в указанном sitemap. Ссылки со страниц сайта не собираются.")
+    st.caption("Pages only: берет только прямые URL страниц из sitemap и игнорирует image:loc / ассеты.")
 
     with st.sidebar:
         st.header("Настройки")
@@ -517,10 +567,13 @@ def main():
         expand_sitemap_index = st.checkbox(
             "Развернуть sitemap index",
             value=False,
-            help=(
-                "Включать только если вы специально вставили sitemap index и хотите собрать URL из его вложенных sitemap. "
-                "Для page-sitemap.xml эта галочка не нужна."
-            ),
+            help="Включать только если вставили sitemap index и хотите собрать URL из вложенных sitemap.",
+        )
+
+        keep_assets = st.checkbox(
+            "Не отсеивать ассеты",
+            value=False,
+            help="По умолчанию выключено: картинки, PDF, JS, CSS и другие файлы не попадают в обход.",
         )
 
         concurrency = st.slider("Параллельных запросов", min_value=1, max_value=30, value=5)
@@ -548,13 +601,15 @@ def main():
         max_pages=int(max_pages),
         user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
         delay_between_requests=float(delay_between_requests),
+        keep_assets=bool(keep_assets),
     )
 
     if "strict_pages" not in st.session_state:
         st.session_state.strict_pages = []
 
     st.info(
-        "Правильный порядок: сначала нажать `Показать URL из sitemap`, проверить список, потом `Запустить обход этих URL`."
+        "Сначала нажмите `Показать URL из sitemap`. В списке не должно быть `/wp-content/uploads/`. "
+        "Потом запускайте обход."
     )
 
     if preview_button:
@@ -564,7 +619,7 @@ def main():
 
         log_box = st.empty()
 
-        with st.spinner("Собираю список URL только из указанных sitemap..."):
+        with st.spinner("Собираю только прямые URL страниц из sitemap..."):
             pages = asyncio.run(
                 collect_urls(
                     sitemap_urls=sitemap_urls,
@@ -578,16 +633,16 @@ def main():
 
         if not pages:
             st.warning(
-                "URL не найдены. Если вы вставили sitemap index, включите `Развернуть sitemap index` "
+                "URL не найдены. Если вставили sitemap index, включите `Развернуть sitemap index` "
                 "или вставьте конкретный page-sitemap.xml."
             )
         else:
-            st.success(f"Найдено URL: {len(pages)}")
+            st.success(f"Найдено URL страниц: {len(pages)}")
             st.dataframe(pages_preview_df(pages), use_container_width=True, hide_index=True)
 
     if st.session_state.strict_pages:
         st.subheader("URL, которые пойдут в обход")
-        st.caption("Краулер обойдет только этот список. Никакие ссылки со страниц сайта не добавляются.")
+        st.caption("Краулер обойдет только этот список. image:loc и ассеты отфильтрованы.")
         st.dataframe(pages_preview_df(st.session_state.strict_pages), use_container_width=True, hide_index=True)
 
     if crawl_button:
@@ -638,7 +693,7 @@ def main():
         st.subheader("Что собирается")
         st.markdown(
             """
-            - **URL** — адрес из указанного sitemap.
+            - **URL** — прямой URL страницы из sitemap.
             - **Status** — HTTP-статус финального ответа.
             - **Final URL** — конечный адрес после редиректов.
             - **Redirect** — был ли редирект.

@@ -1,44 +1,45 @@
-# SEO Sitemap Crawler — Strict URL Mode
+# SEO Sitemap Crawler — Pages Only
 
-Жесткая версия.
+Исправление: краулер берет только URL страниц из sitemap.
 
-## Главное
+## Что исправлено
 
-Краулер НЕ собирает ссылки со страниц сайта.
+В WordPress sitemap внутри каждой страницы могут быть image:loc для картинок.
 
-Он делает только это:
+Пример:
 
-1. Загружает sitemap, который вы вставили.
-2. Показывает список URL, найденных именно в этом sitemap.
-3. Обходит только эти URL.
-4. Собирает Title, Description, index/noindex, canonical, H1.
-5. Экспортирует XLSX / CSV.
+<url>
+  <loc>https://site.ru/page/</loc>
+  <image:image>
+    <image:loc>https://site.ru/wp-content/uploads/image.jpg</image:loc>
+  </image:image>
+</url>
 
-## Важное отличие
+Старая версия брала все loc, включая image:loc.
+Эта версия берет только прямой loc внутри url.
 
-Если вставить sitemap index, например:
+## Дополнительно
 
-https://site.ru/sitemap.xml
+Отсекаются ассеты:
 
-и НЕ включить режим "Развернуть sitemap index", краулер НЕ пойдет во вложенные sitemap.
+- jpg
+- jpeg
+- png
+- gif
+- webp
+- svg
+- pdf
+- css
+- js
+- xml
+- zip
+- rar
+- mp4
+- webm
+- mp3
 
-Если вставить конкретный page-sitemap:
+## Использование
 
-https://site.ru/page-sitemap.xml
-
-он возьмет только URL из него.
-
-## Файлы для GitHub
-
-Замените в корне репозитория:
-
-- app.py
-- requirements.txt
-- runtime.txt
-
-После замены:
-
-1. Push в GitHub.
-2. Streamlit Cloud → Manage app.
-3. Clear cache.
-4. Reboot app.
+1. Замените app.py, requirements.txt, runtime.txt.
+2. Push в GitHub.
+3. Streamlit Cloud → Manage app → Clear cache → Reboot app.
