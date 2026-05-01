@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 APP_TITLE = "SEO Sitemap Crawler"
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/1.2; "
+    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/1.3; "
     "+https://example.com/seo-crawler)"
 )
 
@@ -36,6 +36,7 @@ RESULT_COLUMNS = [
     "Meta robots",
     "X-Robots-Tag",
     "Source sitemap",
+    "Sitemap type",
     "Error",
 ]
 
@@ -125,7 +126,14 @@ async def collect_urls_from_sitemaps(
     settings: CrawlSettings,
     log_box=None,
 ) -> list[dict]:
-    queue = list(dict.fromkeys([url.strip() for url in sitemap_urls if url.strip()]))
+    """
+    ВАЖНО:
+    По умолчанию приложение работает в exact sitemap mode:
+    - если вставлен urlset sitemap, берем URL из него;
+    - если вставлен sitemapindex, НЕ идем во вложенные sitemap, пока пользователь не включит галочку.
+    """
+    initial_sitemaps = list(dict.fromkeys([url.strip() for url in sitemap_urls if url.strip()]))
+    queue = list(initial_sitemaps)
     visited_sitemaps = set()
     pages: list[dict] = []
     headers = {"User-Agent": settings.user_agent}
@@ -150,16 +158,33 @@ async def collect_urls_from_sitemaps(
                 content, _ = await fetch_bytes(client, sitemap_url)
                 sitemap_type, locs = parse_sitemap_xml(content)
 
-                if sitemap_type == "sitemapindex" and settings.follow_nested_sitemaps:
-                    for loc in locs:
-                        if loc not in visited_sitemaps:
-                            queue.append(loc)
+                if sitemap_type == "sitemapindex":
+                    if settings.follow_nested_sitemaps:
+                        if log_box:
+                            log_box.warning(
+                                f"{sitemap_url} — это sitemap index. Включен обход вложенных sitemap: {len(locs)} файлов."
+                            )
+                        for loc in locs:
+                            if loc not in visited_sitemaps:
+                                queue.append(loc)
+                    else:
+                        if log_box:
+                            log_box.warning(
+                                f"{sitemap_url} — это sitemap index. Вложенные sitemap пропущены. "
+                                "Включите галочку, если хотите собрать все вложенные карты."
+                            )
                     continue
 
                 for loc in locs:
                     if len(pages) >= settings.max_pages:
                         break
-                    pages.append({"URL": loc, "Source sitemap": sitemap_url})
+                    pages.append(
+                        {
+                            "URL": loc,
+                            "Source sitemap": sitemap_url,
+                            "Sitemap type": sitemap_type,
+                        }
+                    )
 
             except Exception as exc:
                 if log_box:
@@ -288,6 +313,7 @@ async def crawl_page(
 ) -> dict:
     url = page["URL"]
     source_sitemap = page.get("Source sitemap", "")
+    sitemap_type = page.get("Sitemap type", "")
 
     empty_result = {
         "URL": url,
@@ -304,6 +330,7 @@ async def crawl_page(
         "Meta robots": "",
         "X-Robots-Tag": "",
         "Source sitemap": source_sitemap,
+        "Sitemap type": sitemap_type,
         "Error": "",
     }
 
@@ -350,6 +377,7 @@ async def crawl_page(
             "Meta robots": meta_robots,
             "X-Robots-Tag": x_robots_tag,
             "Source sitemap": source_sitemap,
+            "Sitemap type": sitemap_type,
             "Error": "",
         }
 
@@ -442,8 +470,8 @@ def main():
 
     st.title("🕷️ SEO Sitemap Crawler")
     st.caption(
-        "Краулер берет URL из sitemap, заходит на каждую страницу, читает HTML и выгружает "
-        "Title, Description, Index/noindex, Canonical и H1."
+        "Точный режим: по умолчанию краулер берет только URL из указанных sitemap-файлов, "
+        "а не весь домен."
     )
 
     with st.sidebar:
@@ -487,15 +515,22 @@ def main():
         )
 
         follow_nested_sitemaps = st.checkbox(
-            "Переходить во вложенные sitemap из sitemap index",
-            value=True,
+            "Если это sitemap index — идти во вложенные sitemap",
+            value=False,
+            help=(
+                "Выключено по умолчанию. Если включить, при вставке sitemap.xml краулер соберет URL "
+                "из вложенных sitemap. Если выключено, он берет только URL из конкретных вставленных sitemap-файлов."
+            ),
         )
 
         user_agent = st.text_input("User-Agent", value=DEFAULT_USER_AGENT)
 
         run_button = st.button("🚀 Запустить краулер", type="primary", use_container_width=True)
 
-    st.info("После обхода можно скачать результат в XLSX или CSV.")
+    st.info(
+        "Чтобы собрать только страницы из конкретного файла, вставляйте именно `page-sitemap.xml` "
+        "и не включайте обход вложенных sitemap."
+    )
 
     if run_button:
         sitemap_urls = [line.strip() for line in sitemap_input.splitlines() if line.strip()]
@@ -518,16 +553,19 @@ def main():
         status_text = st.empty()
         started = time.time()
 
-        with st.spinner("Собираю URL из sitemap..."):
+        with st.spinner("Собираю URL строго из указанных sitemap..."):
             pages = asyncio.run(collect_urls_from_sitemaps(sitemap_urls, settings, log_box=log_box))
 
         if not pages:
-            st.error("Не удалось найти URL в sitemap. Проверьте ссылку и доступность файла.")
+            st.error(
+                "Не удалось найти URL. Если вы вставили sitemap index, включите галочку "
+                "«Если это sitemap index — идти во вложенные sitemap» или вставьте конкретный page-sitemap.xml."
+            )
             st.stop()
 
         st.success(f"Найдено URL: {len(pages)}")
 
-        with st.spinner("Обхожу страницы и читаю HTML..."):
+        with st.spinner("Обхожу найденные URL и читаю HTML..."):
             df = asyncio.run(crawl_pages(pages, settings, progress_bar=progress_bar, status_text=status_text))
 
         elapsed = round(time.time() - started, 1)
@@ -564,7 +602,7 @@ def main():
         st.subheader("Что собирается")
         st.markdown(
             """
-            - **URL** — адрес из sitemap.
+            - **URL** — адрес из указанного sitemap.
             - **Status** — HTTP-статус финального ответа.
             - **Final URL** — конечный адрес после редиректов.
             - **Redirect** — был ли редирект.
