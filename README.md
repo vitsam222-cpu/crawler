@@ -1,26 +1,36 @@
-# SEO Sitemap Crawler — Exact Sitemap Mode
+# SEO Sitemap Crawler — Strict URL Mode
 
-Эта версия по умолчанию берет URL строго из тех sitemap-файлов, которые вставлены в поле.
+Жесткая версия.
 
-## Главное изменение
+## Главное
 
-По умолчанию выключен обход вложенных sitemap.
+Краулер НЕ собирает ссылки со страниц сайта.
 
-То есть если вставить:
+Он делает только это:
 
-https://art-lichnost.ru/page-sitemap.xml
+1. Загружает sitemap, который вы вставили.
+2. Показывает список URL, найденных именно в этом sitemap.
+3. Обходит только эти URL.
+4. Собирает Title, Description, index/noindex, canonical, H1.
+5. Экспортирует XLSX / CSV.
 
-краулер возьмет только URL из этого файла.
+## Важное отличие
 
-Если вставить sitemap index:
+Если вставить sitemap index, например:
 
 https://site.ru/sitemap.xml
 
-он НЕ пойдет во все вложенные sitemap, пока вы вручную не включите галочку:
+и НЕ включить режим "Развернуть sitemap index", краулер НЕ пойдет во вложенные sitemap.
 
-"Если это sitemap index — идти во вложенные sitemap"
+Если вставить конкретный page-sitemap:
 
-## Файлы для загрузки в GitHub
+https://site.ru/page-sitemap.xml
+
+он возьмет только URL из него.
+
+## Файлы для GitHub
+
+Замените в корне репозитория:
 
 - app.py
 - requirements.txt

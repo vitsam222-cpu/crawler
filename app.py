@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 APP_TITLE = "SEO Sitemap Crawler"
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/1.3; "
+    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/2.0; "
     "+https://example.com/seo-crawler)"
 )
 
@@ -36,7 +36,6 @@ RESULT_COLUMNS = [
     "Meta robots",
     "X-Robots-Tag",
     "Source sitemap",
-    "Sitemap type",
     "Error",
 ]
 
@@ -47,7 +46,6 @@ class CrawlSettings:
     concurrency: int
     max_pages: int
     user_agent: str
-    follow_nested_sitemaps: bool
     delay_between_requests: float
 
 
@@ -115,28 +113,88 @@ def parse_sitemap_xml(xml_bytes: bytes) -> tuple[str, list[str]]:
     return "unknown", locs
 
 
-async def fetch_bytes(client: httpx.AsyncClient, url: str) -> tuple[bytes, str]:
+def is_probably_sitemap_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(".xml") or "sitemap" in path
+
+
+async def fetch_bytes(client: httpx.AsyncClient, url: str) -> bytes:
     response = await client.get(url, follow_redirects=True)
     response.raise_for_status()
-    return response.content, str(response.url)
+    return response.content
 
 
-async def collect_urls_from_sitemaps(
-    sitemap_urls: list[str],
-    settings: CrawlSettings,
+async def extract_urls_from_one_sitemap(
+    client: httpx.AsyncClient,
+    sitemap_url: str,
+    expand_sitemap_index: bool,
     log_box=None,
 ) -> list[dict]:
     """
-    ВАЖНО:
-    По умолчанию приложение работает в exact sitemap mode:
-    - если вставлен urlset sitemap, берем URL из него;
-    - если вставлен sitemapindex, НЕ идем во вложенные sitemap, пока пользователь не включит галочку.
+    Strict logic:
+    - urlset: return locs as page URLs.
+    - sitemapindex + expand OFF: return empty and warning.
+    - sitemapindex + expand ON: fetch child sitemaps, return their urlset locs.
+    - never crawl page links.
     """
-    initial_sitemaps = list(dict.fromkeys([url.strip() for url in sitemap_urls if url.strip()]))
-    queue = list(initial_sitemaps)
-    visited_sitemaps = set()
-    pages: list[dict] = []
+    if log_box:
+        log_box.info(f"Читаю sitemap: {sitemap_url}")
+
+    content = await fetch_bytes(client, sitemap_url)
+    sitemap_type, locs = parse_sitemap_xml(content)
+
+    if sitemap_type == "urlset":
+        return [{"URL": loc, "Source sitemap": sitemap_url} for loc in locs if loc and not is_probably_sitemap_url(loc)]
+
+    if sitemap_type == "sitemapindex":
+        if not expand_sitemap_index:
+            if log_box:
+                log_box.warning(
+                    f"{sitemap_url} — это sitemap index. Вложенные sitemap НЕ разворачиваются. "
+                    "Вставьте конкретный page-sitemap.xml или включите режим разворота."
+                )
+            return []
+
+        out = []
+        for child_sitemap in locs:
+            if log_box:
+                log_box.info(f"Читаю вложенный sitemap: {child_sitemap}")
+
+            try:
+                child_content = await fetch_bytes(client, child_sitemap)
+                child_type, child_locs = parse_sitemap_xml(child_content)
+
+                if child_type == "urlset":
+                    out.extend(
+                        {"URL": loc, "Source sitemap": child_sitemap}
+                        for loc in child_locs
+                        if loc and not is_probably_sitemap_url(loc)
+                    )
+                else:
+                    if log_box:
+                        log_box.warning(f"Пропущен вложенный sitemap не типа urlset: {child_sitemap}")
+            except Exception as exc:
+                if log_box:
+                    log_box.error(f"Ошибка вложенного sitemap {child_sitemap}: {exc}")
+
+        return out
+
+    # Unknown XML: treat locs as URLs, but filter XML sitemap links unless expand is requested.
+    return [
+        {"URL": loc, "Source sitemap": sitemap_url}
+        for loc in locs
+        if loc and (expand_sitemap_index or not is_probably_sitemap_url(loc))
+    ]
+
+
+async def collect_urls(
+    sitemap_urls: list[str],
+    settings: CrawlSettings,
+    expand_sitemap_index: bool,
+    log_box=None,
+) -> list[dict]:
     headers = {"User-Agent": settings.user_agent}
+    all_pages = []
 
     async with httpx.AsyncClient(
         headers=headers,
@@ -144,62 +202,29 @@ async def collect_urls_from_sitemaps(
         verify=True,
         follow_redirects=True,
     ) as client:
-        while queue and len(pages) < settings.max_pages:
-            sitemap_url = queue.pop(0)
-            if sitemap_url in visited_sitemaps:
-                continue
-
-            visited_sitemaps.add(sitemap_url)
-
+        for sitemap_url in sitemap_urls:
             try:
-                if log_box:
-                    log_box.info(f"Загружаю sitemap: {sitemap_url}")
-
-                content, _ = await fetch_bytes(client, sitemap_url)
-                sitemap_type, locs = parse_sitemap_xml(content)
-
-                if sitemap_type == "sitemapindex":
-                    if settings.follow_nested_sitemaps:
-                        if log_box:
-                            log_box.warning(
-                                f"{sitemap_url} — это sitemap index. Включен обход вложенных sitemap: {len(locs)} файлов."
-                            )
-                        for loc in locs:
-                            if loc not in visited_sitemaps:
-                                queue.append(loc)
-                    else:
-                        if log_box:
-                            log_box.warning(
-                                f"{sitemap_url} — это sitemap index. Вложенные sitemap пропущены. "
-                                "Включите галочку, если хотите собрать все вложенные карты."
-                            )
-                    continue
-
-                for loc in locs:
-                    if len(pages) >= settings.max_pages:
-                        break
-                    pages.append(
-                        {
-                            "URL": loc,
-                            "Source sitemap": sitemap_url,
-                            "Sitemap type": sitemap_type,
-                        }
-                    )
-
+                pages = await extract_urls_from_one_sitemap(
+                    client=client,
+                    sitemap_url=sitemap_url,
+                    expand_sitemap_index=expand_sitemap_index,
+                    log_box=log_box,
+                )
+                all_pages.extend(pages)
             except Exception as exc:
                 if log_box:
-                    log_box.error(f"Ошибка sitemap: {sitemap_url} — {exc}")
+                    log_box.error(f"Ошибка sitemap {sitemap_url}: {exc}")
 
     seen = set()
-    clean_pages = []
-    for item in pages:
+    clean = []
+    for item in all_pages:
         url = item["URL"]
         if url in seen:
             continue
         seen.add(url)
-        clean_pages.append(item)
+        clean.append(item)
 
-    return clean_pages[: settings.max_pages]
+    return clean[: settings.max_pages]
 
 
 def meta_by_name(soup: BeautifulSoup, names: set[str]) -> str:
@@ -313,7 +338,6 @@ async def crawl_page(
 ) -> dict:
     url = page["URL"]
     source_sitemap = page.get("Source sitemap", "")
-    sitemap_type = page.get("Sitemap type", "")
 
     empty_result = {
         "URL": url,
@@ -330,7 +354,6 @@ async def crawl_page(
         "Meta robots": "",
         "X-Robots-Tag": "",
         "Source sitemap": source_sitemap,
-        "Sitemap type": sitemap_type,
         "Error": "",
     }
 
@@ -377,7 +400,6 @@ async def crawl_page(
             "Meta robots": meta_robots,
             "X-Robots-Tag": x_robots_tag,
             "Source sitemap": source_sitemap,
-            "Sitemap type": sitemap_type,
             "Error": "",
         }
 
@@ -435,7 +457,7 @@ def make_xlsx(df: pd.DataFrame) -> bytes:
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, sheet_name="All", index=False)
 
-        if "URL" in df.columns:
+        if "URL" in df.columns and not df.empty:
             for domain, group in df.groupby(df["URL"].map(lambda u: urlparse(str(u)).netloc or "unknown")):
                 sheet_name = sheet_name_from_domain(domain)
                 group.to_excel(writer, sheet_name=sheet_name, index=False)
@@ -465,14 +487,15 @@ def default_sitemaps() -> str:
     )
 
 
+def pages_preview_df(pages: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(pages)[["URL", "Source sitemap"]] if pages else pd.DataFrame(columns=["URL", "Source sitemap"])
+
+
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="🕷️", layout="wide")
 
     st.title("🕷️ SEO Sitemap Crawler")
-    st.caption(
-        "Точный режим: по умолчанию краулер берет только URL из указанных sitemap-файлов, "
-        "а не весь домен."
-    )
+    st.caption("Жесткий режим: краулер обходит только URL, найденные в указанном sitemap. Ссылки со страниц сайта не собираются.")
 
     with st.sidebar:
         st.header("Настройки")
@@ -491,20 +514,18 @@ def main():
             step=50,
         )
 
-        concurrency = st.slider(
-            "Параллельных запросов",
-            min_value=1,
-            max_value=30,
-            value=5,
+        expand_sitemap_index = st.checkbox(
+            "Развернуть sitemap index",
+            value=False,
+            help=(
+                "Включать только если вы специально вставили sitemap index и хотите собрать URL из его вложенных sitemap. "
+                "Для page-sitemap.xml эта галочка не нужна."
+            ),
         )
 
-        timeout = st.number_input(
-            "Timeout на запрос, сек.",
-            min_value=3,
-            max_value=120,
-            value=20,
-            step=1,
-        )
+        concurrency = st.slider("Параллельных запросов", min_value=1, max_value=30, value=5)
+
+        timeout = st.number_input("Timeout на запрос, сек.", min_value=3, max_value=120, value=20, step=1)
 
         delay_between_requests = st.number_input(
             "Пауза после запроса, сек.",
@@ -514,58 +535,73 @@ def main():
             step=0.1,
         )
 
-        follow_nested_sitemaps = st.checkbox(
-            "Если это sitemap index — идти во вложенные sitemap",
-            value=False,
-            help=(
-                "Выключено по умолчанию. Если включить, при вставке sitemap.xml краулер соберет URL "
-                "из вложенных sitemap. Если выключено, он берет только URL из конкретных вставленных sitemap-файлов."
-            ),
-        )
-
         user_agent = st.text_input("User-Agent", value=DEFAULT_USER_AGENT)
 
-        run_button = st.button("🚀 Запустить краулер", type="primary", use_container_width=True)
+        preview_button = st.button("1. Показать URL из sitemap", use_container_width=True)
+        crawl_button = st.button("2. Запустить обход этих URL", type="primary", use_container_width=True)
 
-    st.info(
-        "Чтобы собрать только страницы из конкретного файла, вставляйте именно `page-sitemap.xml` "
-        "и не включайте обход вложенных sitemap."
+    sitemap_urls = [line.strip() for line in sitemap_input.splitlines() if line.strip()]
+
+    settings = CrawlSettings(
+        timeout=float(timeout),
+        concurrency=int(concurrency),
+        max_pages=int(max_pages),
+        user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
+        delay_between_requests=float(delay_between_requests),
     )
 
-    if run_button:
-        sitemap_urls = [line.strip() for line in sitemap_input.splitlines() if line.strip()]
+    if "strict_pages" not in st.session_state:
+        st.session_state.strict_pages = []
 
+    st.info(
+        "Правильный порядок: сначала нажать `Показать URL из sitemap`, проверить список, потом `Запустить обход этих URL`."
+    )
+
+    if preview_button:
         if not sitemap_urls:
             st.error("Добавьте хотя бы одну ссылку на sitemap.")
             st.stop()
 
-        settings = CrawlSettings(
-            timeout=float(timeout),
-            concurrency=int(concurrency),
-            max_pages=int(max_pages),
-            user_agent=user_agent.strip() or DEFAULT_USER_AGENT,
-            follow_nested_sitemaps=bool(follow_nested_sitemaps),
-            delay_between_requests=float(delay_between_requests),
-        )
-
         log_box = st.empty()
+
+        with st.spinner("Собираю список URL только из указанных sitemap..."):
+            pages = asyncio.run(
+                collect_urls(
+                    sitemap_urls=sitemap_urls,
+                    settings=settings,
+                    expand_sitemap_index=expand_sitemap_index,
+                    log_box=log_box,
+                )
+            )
+
+        st.session_state.strict_pages = pages
+
+        if not pages:
+            st.warning(
+                "URL не найдены. Если вы вставили sitemap index, включите `Развернуть sitemap index` "
+                "или вставьте конкретный page-sitemap.xml."
+            )
+        else:
+            st.success(f"Найдено URL: {len(pages)}")
+            st.dataframe(pages_preview_df(pages), use_container_width=True, hide_index=True)
+
+    if st.session_state.strict_pages:
+        st.subheader("URL, которые пойдут в обход")
+        st.caption("Краулер обойдет только этот список. Никакие ссылки со страниц сайта не добавляются.")
+        st.dataframe(pages_preview_df(st.session_state.strict_pages), use_container_width=True, hide_index=True)
+
+    if crawl_button:
+        pages = st.session_state.strict_pages
+
+        if not pages:
+            st.error("Сначала нажмите `Показать URL из sitemap` и проверьте список.")
+            st.stop()
+
         progress_bar = st.progress(0)
         status_text = st.empty()
         started = time.time()
 
-        with st.spinner("Собираю URL строго из указанных sitemap..."):
-            pages = asyncio.run(collect_urls_from_sitemaps(sitemap_urls, settings, log_box=log_box))
-
-        if not pages:
-            st.error(
-                "Не удалось найти URL. Если вы вставили sitemap index, включите галочку "
-                "«Если это sitemap index — идти во вложенные sitemap» или вставьте конкретный page-sitemap.xml."
-            )
-            st.stop()
-
-        st.success(f"Найдено URL: {len(pages)}")
-
-        with st.spinner("Обхожу найденные URL и читаю HTML..."):
+        with st.spinner("Обхожу только показанные URL и читаю HTML..."):
             df = asyncio.run(crawl_pages(pages, settings, progress_bar=progress_bar, status_text=status_text))
 
         elapsed = round(time.time() - started, 1)
@@ -598,7 +634,7 @@ def main():
             use_container_width=True,
         )
 
-    else:
+    if not preview_button and not crawl_button:
         st.subheader("Что собирается")
         st.markdown(
             """
