@@ -3,6 +3,7 @@ import gzip
 import io
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urlparse
@@ -15,12 +16,10 @@ from bs4 import BeautifulSoup
 
 APP_TITLE = "SEO Sitemap Crawler"
 
-
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/1.0; "
+    "Mozilla/5.0 (compatible; SEO-Sitemap-Crawler/1.2; "
     "+https://example.com/seo-crawler)"
 )
-
 
 RESULT_COLUMNS = [
     "URL",
@@ -83,21 +82,36 @@ def decompress_if_needed(content: bytes) -> bytes:
     return content
 
 
+def strip_namespace(tag: str) -> str:
+    return tag.split("}", 1)[-1] if "}" in tag else tag
+
+
 def parse_sitemap_xml(xml_bytes: bytes) -> tuple[str, list[str]]:
     xml_bytes = decompress_if_needed(xml_bytes)
-    soup = BeautifulSoup(xml_bytes, "xml")
 
-    if soup.find("sitemapindex"):
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        soup = BeautifulSoup(xml_bytes, "html.parser")
         locs = [normalize_text(loc.get_text()) for loc in soup.find_all("loc")]
-        return "sitemapindex", [loc for loc in locs if loc]
+        return "unknown", [loc for loc in locs if loc]
 
-    if soup.find("urlset"):
-        locs = [normalize_text(loc.get_text()) for loc in soup.find_all("loc")]
-        return "urlset", [loc for loc in locs if loc]
+    root_name = strip_namespace(root.tag).lower()
+    locs = []
 
-    # Fallback: some generators return XML without expected root or with namespaces.
-    locs = [normalize_text(loc.get_text()) for loc in soup.find_all("loc")]
-    return "unknown", [loc for loc in locs if loc]
+    for elem in root.iter():
+        if strip_namespace(elem.tag).lower() == "loc" and elem.text:
+            loc = normalize_text(elem.text)
+            if loc:
+                locs.append(loc)
+
+    if root_name == "sitemapindex":
+        return "sitemapindex", locs
+
+    if root_name == "urlset":
+        return "urlset", locs
+
+    return "unknown", locs
 
 
 async def fetch_bytes(client: httpx.AsyncClient, url: str) -> tuple[bytes, str]:
@@ -114,7 +128,6 @@ async def collect_urls_from_sitemaps(
     queue = list(dict.fromkeys([url.strip() for url in sitemap_urls if url.strip()]))
     visited_sitemaps = set()
     pages: list[dict] = []
-
     headers = {"User-Agent": settings.user_agent}
 
     async with httpx.AsyncClient(
@@ -132,9 +145,9 @@ async def collect_urls_from_sitemaps(
 
             try:
                 if log_box:
-                    log_box.write(f"Загружаю sitemap: {sitemap_url}")
+                    log_box.info(f"Загружаю sitemap: {sitemap_url}")
 
-                content, final_sitemap_url = await fetch_bytes(client, sitemap_url)
+                content, _ = await fetch_bytes(client, sitemap_url)
                 sitemap_type, locs = parse_sitemap_xml(content)
 
                 if sitemap_type == "sitemapindex" and settings.follow_nested_sitemaps:
@@ -146,18 +159,12 @@ async def collect_urls_from_sitemaps(
                 for loc in locs:
                     if len(pages) >= settings.max_pages:
                         break
-                    pages.append(
-                        {
-                            "URL": loc,
-                            "Source sitemap": sitemap_url,
-                        }
-                    )
+                    pages.append({"URL": loc, "Source sitemap": sitemap_url})
 
             except Exception as exc:
                 if log_box:
-                    log_box.write(f"Ошибка sitemap: {sitemap_url} — {exc}")
+                    log_box.error(f"Ошибка sitemap: {sitemap_url} — {exc}")
 
-    # Deduplicate URLs but keep first source sitemap.
     seen = set()
     clean_pages = []
     for item in pages:
@@ -173,20 +180,14 @@ async def collect_urls_from_sitemaps(
 def meta_by_name(soup: BeautifulSoup, names: set[str]) -> str:
     values = []
     for meta in soup.find_all("meta"):
-        name = (meta.get("name") or meta.get("property") or "").strip().lower()
+        name = (meta.get("name") or "").strip().lower()
         if name in names:
             values.append(meta.get("content") or "")
     return normalize_text(" ".join(unique_non_empty(values)))
 
 
 def get_description(soup: BeautifulSoup) -> str:
-    # Primary: standard meta description.
-    value = meta_by_name(soup, {"description"})
-    if value:
-        return value
-
-    # Fallbacks are not true meta description, but useful for diagnostics.
-    return ""
+    return meta_by_name(soup, {"description"})
 
 
 def get_canonical(soup: BeautifulSoup) -> str:
@@ -221,7 +222,8 @@ def is_hidden_tag(tag) -> bool:
         if "display:none" in style or "visibility:hidden" in style:
             return True
 
-        classes = " ".join(current.get("class", [])) if isinstance(current.get("class"), list) else str(current.get("class", ""))
+        classes_raw = current.get("class", "")
+        classes = " ".join(classes_raw) if isinstance(classes_raw, list) else str(classes_raw)
         if HIDDEN_CLASS_RE.search(classes):
             return True
 
@@ -312,11 +314,10 @@ async def crawl_page(
         had_redirect = len(response.history) > 0
         redirect_chain = get_redirect_chain(response)
 
-        content_type = response.headers.get("content-type", "")
         x_robots_tag = normalize_text(response.headers.get("x-robots-tag", ""))
 
-        html = response.text if "html" in content_type.lower() or response.text else ""
-        soup = BeautifulSoup(html, "lxml")
+        html = response.text or ""
+        soup = BeautifulSoup(html, "html.parser")
 
         title = normalize_text(soup.title.get_text(" ", strip=True) if soup.title else "")
         description = get_description(soup)
@@ -365,7 +366,6 @@ async def crawl_pages(
 ) -> pd.DataFrame:
     headers = {"User-Agent": settings.user_agent}
     timeout = httpx.Timeout(settings.timeout)
-
     semaphore = asyncio.Semaphore(settings.concurrency)
     results = []
     completed = 0
@@ -415,35 +415,20 @@ def make_xlsx(df: pd.DataFrame) -> bytes:
         workbook = writer.book
         for sheet in workbook.worksheets:
             sheet.freeze_panes = "A2"
-            widths = {
-                "A": 46,
-                "B": 10,
-                "C": 46,
-                "D": 12,
-                "E": 70,
-                "F": 44,
-                "G": 70,
-                "H": 16,
-                "I": 44,
-                "J": 60,
-                "K": 10,
-                "L": 28,
-                "M": 28,
-                "N": 46,
-                "O": 40,
-            }
 
-            for letter, width in widths.items():
-                sheet.column_dimensions[letter].width = width
-
-            for row in sheet.iter_rows():
-                for cell in row:
+            for col in sheet.columns:
+                max_length = 0
+                col_letter = col[0].column_letter
+                for cell in col:
+                    value = "" if cell.value is None else str(cell.value)
+                    max_length = max(max_length, min(len(value), 80))
                     cell.alignment = cell.alignment.copy(wrap_text=True, vertical="top")
+                sheet.column_dimensions[col_letter].width = max(12, min(max_length + 2, 70))
 
     return output.getvalue()
 
 
-def load_example_urls() -> str:
+def default_sitemaps() -> str:
     return "\n".join(
         [
             "https://art-lichnost.ru/page-sitemap.xml",
@@ -453,16 +438,12 @@ def load_example_urls() -> str:
 
 
 def main():
-    st.set_page_config(
-        page_title=APP_TITLE,
-        page_icon="🕷️",
-        layout="wide",
-    )
+    st.set_page_config(page_title=APP_TITLE, page_icon="🕷️", layout="wide")
 
     st.title("🕷️ SEO Sitemap Crawler")
     st.caption(
-        "Серверный краулер: берет URL из sitemap, заходит на каждую страницу, "
-        "читает HTML и выгружает Title, Description, Index/noindex, Canonical, H1."
+        "Краулер берет URL из sitemap, заходит на каждую страницу, читает HTML и выгружает "
+        "Title, Description, Index/noindex, Canonical и H1."
     )
 
     with st.sidebar:
@@ -470,9 +451,8 @@ def main():
 
         sitemap_input = st.text_area(
             "Sitemap URL — один или несколько",
-            value=load_example_urls(),
+            value=default_sitemaps(),
             height=110,
-            help="Каждая ссылка с новой строки. Можно вставлять sitemap.xml, page-sitemap.xml или sitemap index.",
         )
 
         max_pages = st.number_input(
@@ -488,7 +468,6 @@ def main():
             min_value=1,
             max_value=30,
             value=5,
-            help="Для чужих сайтов лучше 3–5. Для своего сайта можно выше.",
         )
 
         timeout = st.number_input(
@@ -512,16 +491,11 @@ def main():
             value=True,
         )
 
-        user_agent = st.text_input(
-            "User-Agent",
-            value=DEFAULT_USER_AGENT,
-        )
+        user_agent = st.text_input("User-Agent", value=DEFAULT_USER_AGENT)
 
         run_button = st.button("🚀 Запустить краулер", type="primary", use_container_width=True)
 
-    st.info(
-        "Результат можно скачать в XLSX. В Excel будет общий лист `All` и отдельные листы по доменам."
-    )
+    st.info("После обхода можно скачать результат в XLSX или CSV.")
 
     if run_button:
         sitemap_urls = [line.strip() for line in sitemap_input.splitlines() if line.strip()]
@@ -542,7 +516,6 @@ def main():
         log_box = st.empty()
         progress_bar = st.progress(0)
         status_text = st.empty()
-
         started = time.time()
 
         with st.spinner("Собираю URL из sitemap..."):
@@ -558,7 +531,6 @@ def main():
             df = asyncio.run(crawl_pages(pages, settings, progress_bar=progress_bar, status_text=status_text))
 
         elapsed = round(time.time() - started, 1)
-
         st.success(f"Готово. Обработано {len(df)} URL за {elapsed} сек.")
 
         c1, c2, c3, c4, c5 = st.columns(5)
